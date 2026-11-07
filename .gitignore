@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+Logs/
+Results/
+!Results/.gitkeep
+*.lp
+*.mps
+*.sol
+.vscode/
+.idea/
