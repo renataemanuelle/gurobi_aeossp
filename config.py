@@ -39,9 +39,10 @@ DEFAULT_LOG_DIR = os.environ.get(
 # Physical constants (matching the C++ decoder in Problem.h)
 # ---------------------------------------------------------------------------
 EARTH_RADIUS_KM = 6371.0
-SATELLITE_ALTITUDE_KM = 550.0
+SATELLITE_ALTITUDE_KM = 694.0         # matches RKO precompute default
 SLEW_RATE_DEG_PER_SEC = 2.5          # 30° in 12 s
-STEREO_ORBIT_THRESHOLD_SEC = 600.0   # min epoch gap for different orbits
+STEREO_ANGLE_MIN = 15.0              # min viewing angle for valid stereo pair (degrees)
+STEREO_ANGLE_MAX = 20.0              # max viewing angle for valid stereo pair (degrees)
 
 # ---------------------------------------------------------------------------
 # Instance catalogue — tag → {size, maxtime}

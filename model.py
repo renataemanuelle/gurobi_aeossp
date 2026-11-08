@@ -7,29 +7,31 @@ Objective:  max Σ score_i · x_i
 
 Constraints
   1. Request limit     — per ID group: Σ x_i ≤ max(stereo+1, strips)
-  2. No temporal overlap — per satellite pair with overlapping windows
-  3. Maneuver feasibility — per satellite pair without enough slew gap
-  4. Stereo enforcement  — stereo acq requires ≥ 1 partner from another orbit
+  2. No temporal overlap — per satellite pair with overlapping intervals
+  3. Maneuver feasibility — per satellite pair without enough slew time
+     (lifted constraint for non-adjacent pairs)
+  4. Stereo enforcement  — stereo acq requires ≥ 1 partner with viewing
+     angle in [15°, 20°] (matching RKO stereo pair criterion)
 """
 
 import math
 import time as _time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import gurobipy as gp
 from gurobipy import GRB
 
-from config import SLEW_RATE_DEG_PER_SEC, STEREO_ORBIT_THRESHOLD_SEC
+from config import SLEW_RATE_DEG_PER_SEC, STEREO_ANGLE_MIN, STEREO_ANGLE_MAX
 from instance_parser import Acquisition
 
 
-def _angle_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Central angle (degrees) between two satellite sub-points.
+# ---------------------------------------------------------------------------
+# Geometric helpers
+# ---------------------------------------------------------------------------
 
-    Both positions share the same orbital altitude, so the angle equals
-    the great-circle angular distance on a sphere of radius R+h.
-    """
+def _angle_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Central angle (degrees) between two points on a sphere."""
     la1 = math.radians(lat1)
     lo1 = math.radians(lon1)
     la2 = math.radians(lat2)
@@ -41,20 +43,77 @@ def _angle_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return math.degrees(math.acos(cos_a))
 
 
+def _viewing_angle_deg(a: Acquisition, b: Acquisition) -> float:
+    """Angle (degrees) between two line-of-sight vectors (sat → request).
+
+    This matches the RKO ``maneuver_angle_deg_fast`` function exactly.
+    """
+    v1x = a.sat_x - a.req_x
+    v1y = a.sat_y - a.req_y
+    v1z = a.sat_z - a.req_z
+
+    v2x = b.sat_x - b.req_x
+    v2y = b.sat_y - b.req_y
+    v2z = b.sat_z - b.req_z
+
+    dot = v1x * v2x + v1y * v2y + v1z * v2z
+    n1 = math.sqrt(v1x * v1x + v1y * v1y + v1z * v1z)
+    n2 = math.sqrt(v2x * v2x + v2y * v2y + v2z * v2z)
+
+    if n1 == 0.0 or n2 == 0.0:
+        return 0.0
+
+    cos_theta = max(-1.0, min(1.0, dot / (n1 * n2)))
+    return math.degrees(math.acos(cos_theta))
+
+
+# ---------------------------------------------------------------------------
+# Pre-compute stereo pairs (same criterion as RKO: viewing angle ∈ [15°, 20°])
+# ---------------------------------------------------------------------------
+
+def _compute_stereo_pairs(
+    acquisitions: List[Acquisition],
+) -> Tuple[List[Tuple[int, int]], Dict[int, List[int]]]:
+    """Return (stereo_pairs, stereo_partners) matching the RKO criterion."""
+    stereo_groups: Dict[str, List[int]] = defaultdict(list)
+    for i, a in enumerate(acquisitions):
+        if a.stereo > 0:
+            stereo_groups[a.req_id].append(i)
+
+    stereo_pairs: List[Tuple[int, int]] = []
+    stereo_partners: Dict[int, List[int]] = defaultdict(list)
+
+    for _req_id, s_indices in stereo_groups.items():
+        for pa in range(len(s_indices)):
+            for pb in range(pa + 1, len(s_indices)):
+                i, j = s_indices[pa], s_indices[pb]
+                angle = _viewing_angle_deg(acquisitions[i], acquisitions[j])
+                if STEREO_ANGLE_MIN <= angle <= STEREO_ANGLE_MAX:
+                    stereo_pairs.append((i, j))
+                    stereo_partners[i].append(j)
+                    stereo_partners[j].append(i)
+
+    return stereo_pairs, stereo_partners
+
+
+# ---------------------------------------------------------------------------
+# Main solver
+# ---------------------------------------------------------------------------
+
 def build_and_solve(
     acquisitions: List[Acquisition],
-    time_limit: float,
     log_file: Optional[str] = None,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """Construct the AEOSSP ILP, solve it, and return solution metadata.
 
+    The solver runs as an exact method with no time limit, optimizing
+    until proven optimality (or infeasibility).
+
     Parameters
     ----------
     acquisitions : list[Acquisition]
-        Parsed acquisition data (one per CSV row).
-    time_limit : float
-        Gurobi TimeLimit in seconds.
+        Parsed acquisition data (one per CSV row, after dedup).
     log_file : str | None
         If given, Gurobi writes its log here.
     verbose : bool
@@ -70,6 +129,13 @@ def build_and_solve(
     if verbose:
         print(f"  Building model with {n} acquisitions …")
 
+    # ---- Pre-compute stereo pairs ----
+    stereo_pairs, stereo_partners = _compute_stereo_pairs(acquisitions)
+
+    if verbose:
+        print(f"    {len(stereo_pairs)} stereo pairs (viewing angle "
+              f"[{STEREO_ANGLE_MIN}°, {STEREO_ANGLE_MAX}°])")
+
     # ---- Gurobi environment & model ----
     env = gp.Env(empty=True)
     env.setParam("OutputFlag", 1 if verbose else 0)
@@ -78,9 +144,7 @@ def build_and_solve(
     env.start()
 
     model = gp.Model("AEOSSP", env=env)
-    model.setParam("TimeLimit", time_limit)
     model.setParam("Threads", 0)          # auto-detect
-    model.setParam("MIPFocus", 1)         # emphasise feasible solutions
 
     # ---- Decision variables ----
     x = model.addVars(n, vtype=GRB.BINARY, name="x")
@@ -116,6 +180,14 @@ def build_and_solve(
 
     # ------------------------------------------------------------------
     # Constraints 2 & 3 — Overlap + maneuver (per satellite)
+    #
+    # Overlap:  pairwise x_i + x_j ≤ 1  (always correct)
+    # Maneuver: lifted constraint for non-adjacent pairs:
+    #     x_i + x_j  - Σ_{k between i,j on same sat} x_k  ≤ 1
+    #
+    # The lifted form allows both i and j to be selected when an
+    # intermediate acquisition k is also selected (making them
+    # non-adjacent), which matches the RKO greedy decoder behaviour.
     # ------------------------------------------------------------------
     sat_groups: Dict[str, List[int]] = defaultdict(list)
     for i, a in enumerate(acquisitions):
@@ -123,59 +195,68 @@ def build_and_solve(
 
     max_maneuver = 180.0 / SLEW_RATE_DEG_PER_SEC  # 72 s upper bound
 
-    n_conflict = 0
+    n_overlap = 0
+    n_maneuver = 0
     for sat_id, indices in sat_groups.items():
         indices.sort(key=lambda i: acquisitions[i].time)
 
         for pa in range(len(indices)):
             i = indices[pa]
             ai = acquisitions[i]
-            end_i = ai.time + math.ceil(ai.duration)
 
             for pb in range(pa + 1, len(indices)):
                 j = indices[pb]
                 aj = acquisitions[j]
 
-                # Early exit: no more possible conflicts
-                if aj.time >= end_i + max_maneuver:
+                delta_t = aj.time - ai.time
+
+                # Early exit: beyond maximum infeasible delta_t
+                if delta_t >= ai.duration + max_maneuver:
                     break
 
-                end_j = aj.time + math.ceil(aj.duration)
-
-                # Overlap?
-                if aj.time < end_i:
+                # Overlap: j starts before i's interval ends (ceil'd duration)
+                if aj.time < ai.time + math.ceil(ai.duration):
                     model.addConstr(x[i] + x[j] <= 1,
                                     name=f"ovlp_{i}_{j}")
-                    n_conflict += 1
+                    n_overlap += 1
                     continue
 
-                # Maneuver feasibility
-                gap = aj.time - end_i
-                angle = _angle_deg(ai.sat_lat, ai.sat_lon,
-                                   aj.sat_lat, aj.sat_lon)
-                if gap < angle / SLEW_RATE_DEG_PER_SEC:
-                    model.addConstr(x[i] + x[j] <= 1,
-                                    name=f"mnvr_{i}_{j}")
-                    n_conflict += 1
+                # Maneuver feasibility (matches RKO exactly):
+                #   feasible iff duration_i + angle/speed ≤ delta_t
+                angle = _viewing_angle_deg(ai, aj)
+                t_maneuver = angle / SLEW_RATE_DEG_PER_SEC
+
+                if ai.duration + t_maneuver > delta_t:
+                    # Infeasible direct maneuver — use lifted constraint
+                    between = [indices[pk] for pk in range(pa + 1, pb)]
+                    if between:
+                        model.addConstr(
+                            x[i] + x[j]
+                            - gp.quicksum(x[k] for k in between)
+                            <= 1,
+                            name=f"mnvr_{i}_{j}",
+                        )
+                    else:
+                        model.addConstr(x[i] + x[j] <= 1,
+                                        name=f"mnvr_{i}_{j}")
+                    n_maneuver += 1
 
     if verbose:
-        print(f"    {n_conflict} conflict constraints (overlap + maneuver)")
+        print(f"    {n_overlap} overlap constraints")
+        print(f"    {n_maneuver} maneuver constraints (lifted)")
 
     # ------------------------------------------------------------------
     # Constraint 4 — Stereo enforcement
+    # A stereo acquisition (stereo > 0) can only be selected if at
+    # least one valid stereo partner is also selected.
+    # Partners: same ID, both stereo > 0, viewing angle ∈ [15°, 20°].
     # ------------------------------------------------------------------
     n_stereo = 0
     for i, ai in enumerate(acquisitions):
         if ai.stereo <= 0:
             continue
 
-        partners = [
-            j for j in id_groups[ai.req_id]
-            if j != i
-            and acquisitions[j].satellite == ai.satellite
-            and acquisitions[j].stereo > 0
-            and abs(acquisitions[j].time - ai.time) > STEREO_ORBIT_THRESHOLD_SEC
-        ]
+        partners = stereo_partners.get(i, [])
 
         if not partners:
             x[i].UB = 0
@@ -197,7 +278,7 @@ def build_and_solve(
         print(f"  Model ready: {model.NumVars} vars, "
               f"{model.NumConstrs} constraints  "
               f"(built in {build_time:.1f} s)")
-        print(f"  Optimizing with TimeLimit = {time_limit} s …")
+        print(f"  Optimizing (exact — no time limit) …")
 
     model.optimize()
 
@@ -208,8 +289,10 @@ def build_and_solve(
         "num_variables": model.NumVars,
         "num_constraints": model.NumConstrs,
         "num_request_constraints": n_req,
-        "num_conflict_constraints": n_conflict,
+        "num_overlap_constraints": n_overlap,
+        "num_maneuver_constraints": n_maneuver,
         "num_stereo_constraints": n_stereo,
+        "stereo_pairs": stereo_pairs,
         "build_time": build_time,
         "status": model.Status,
         "status_str": _status_str(model.Status),
