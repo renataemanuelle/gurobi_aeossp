@@ -131,19 +131,19 @@ def test_maneuver_constraint():
     print("  PASS  maneuver_constraint")
 
 
-def test_stereo_enforcement():
-    """Stereo acq without a partner on a different orbit → forced to 0."""
+def test_stereo_no_partner_treated_as_mono():
+    """Stereo acq without any valid partner → treated as mono, can be selected."""
     acqs = [
         _make_acq(0, 0, "R1", 1, "SAT1", 0, 0, 100, 1, 5, 100.0),
         _make_acq(1, 1, "R2", 0, "SAT1", 0, 0, 500, 1, 5,   5.0),
     ]
-    # Acq 0 is stereo=1 but no partner (only acq in group R1 with stereo>0)
+    # Acq 0 is stereo=1 but has no valid partner (no pair with angle ∈ [15°,20°]).
+    # Per RKO behaviour, it is treated as mono and CAN be selected.
     sol = build_and_solve(acqs, verbose=False)
     assert sol["is_optimal"]
-    assert 0 not in sol["selected_indices"], "Stereo acq 0 should be excluded"
-    assert sol["num_selected"] == 1
-    assert abs(sol["objective"] - 5.0) < 1e-6
-    print("  PASS  stereo_enforcement_no_partner")
+    assert sol["num_selected"] == 2, f"Expected 2, got {sol['num_selected']}"
+    assert abs(sol["objective"] - 105.0) < 1e-6
+    print("  PASS  stereo_no_partner_treated_as_mono")
 
 
 def test_stereo_with_partner():
@@ -165,7 +165,11 @@ def test_stereo_with_partner():
 
 
 def test_stereo_partner_too_close():
-    """Two stereo acqs same ID/sat at identical position → angle=0 → no partner."""
+    """Two stereo acqs same ID/sat at identical position → angle=0 → no valid pair.
+
+    Without valid partners, both are treated as mono (RKO behaviour).
+    Request limit = max(stereo+1, strips) = max(2, 1) = 2, so both selected.
+    """
     acqs = [
         _make_acq(0, 0, "R1", 1, "SAT1", 0, 0, 100, 1, 5, 50.0),
         _make_acq(1, 1, "R1", 1, "SAT1", 0, 0, 500, 1, 5, 50.0),
@@ -175,9 +179,37 @@ def test_stereo_partner_too_close():
 
     sol = build_and_solve(acqs, verbose=False)
     assert sol["is_optimal"]
-    assert sol["num_selected"] == 0
-    assert abs(sol["objective"] - 0.0) < 1e-6
+    assert sol["num_selected"] == 2
+    assert abs(sol["objective"] - 100.0) < 1e-6
     print("  PASS  stereo_partner_too_close")
+
+
+def test_stereo_enforced_with_partners():
+    """Stereo acq WITH valid partners must have ≥ 1 partner selected.
+
+    Acq 0 (stereo, high score) has a valid partner acq 1 (stereo, low score).
+    Acq 2 (mono, medium score) overlaps with acq 1 in time.
+    The solver must sacrifice acq 2 to select the stereo pair (0+1).
+    """
+    acqs = [
+        _make_acq(0, 0, "R1", 1, "SAT1", 0.0,  0.0, 100, 1, 5, 80.0),
+        _make_acq(1, 1, "R1", 1, "SAT1", 0.0, 17.5, 500, 1, 5, 10.0),
+        _make_acq(2, 2, "R2", 0, "SAT1", 0.0, 17.5, 502, 1, 5, 50.0),
+    ]
+    # Acq 1 and 2 overlap (500 vs 502, duration 5 → ceil=5, 502 < 505)
+    # Without stereo: solver picks 0 (80) + 2 (50) = 130
+    # With stereo: acq 0 needs partner 1, so picks 0 (80) + 1 (10) = 90
+    #   (can't pick 2 because it overlaps with 1)
+    # OR picks 2 (50) alone = 50. Best is 0+1 = 90.
+    angle = _viewing_angle_deg(acqs[0], acqs[1])
+    assert 15.0 <= angle <= 20.0, f"Expected angle in [15,20], got {angle:.2f}"
+
+    sol = build_and_solve(acqs, verbose=False)
+    assert sol["is_optimal"]
+    assert 0 in sol["selected_indices"], "Stereo acq 0 should be selected"
+    assert 1 in sol["selected_indices"], "Partner acq 1 should be selected"
+    assert abs(sol["objective"] - 90.0) < 1e-6
+    print("  PASS  stereo_enforced_with_partners")
 
 
 def test_angle_calculation():
@@ -214,9 +246,10 @@ if __name__ == "__main__":
         test_request_limit,
         test_request_limit_stereo,
         test_maneuver_constraint,
-        test_stereo_enforcement,
+        test_stereo_no_partner_treated_as_mono,
         test_stereo_with_partner,
         test_stereo_partner_too_close,
+        test_stereo_enforced_with_partners,
     ]
 
     print(f"Running {len(tests)} tests …\n")

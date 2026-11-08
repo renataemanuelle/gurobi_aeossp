@@ -247,11 +247,14 @@ def build_and_solve(
 
     # ------------------------------------------------------------------
     # Constraint 4 — Stereo enforcement
-    # A stereo acquisition (stereo > 0) can only be selected if at
-    # least one valid stereo partner is also selected.
-    # Partners: same ID, both stereo > 0, viewing angle ∈ [15°, 20°].
+    # A stereo acquisition (stereo > 0) that has valid partners can
+    # only be selected if at least one partner is also selected.
+    # If NO valid partners exist (no pair with viewing angle ∈ [15°,20°]),
+    # the acquisition is treated as mono (no constraint added),
+    # matching the RKO greedy decoder behaviour.
     # ------------------------------------------------------------------
     n_stereo = 0
+    n_stereo_free = 0
     for i, ai in enumerate(acquisitions):
         if ai.stereo <= 0:
             continue
@@ -259,16 +262,17 @@ def build_and_solve(
         partners = stereo_partners.get(i, [])
 
         if not partners:
-            x[i].UB = 0
+            n_stereo_free += 1
         else:
             model.addConstr(
                 x[i] <= gp.quicksum(x[j] for j in partners),
                 name=f"stereo_{i}",
             )
-        n_stereo += 1
+            n_stereo += 1
 
     if verbose:
-        print(f"    {n_stereo} stereo constraints")
+        print(f"    {n_stereo} stereo constraints "
+              f"({n_stereo_free} stereo acqs without partners → treated as mono)")
 
     # ------------------------------------------------------------------
     model.update()
