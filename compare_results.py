@@ -80,10 +80,12 @@ def _read_rko(tag: str, rko_dir: str) -> Dict[str, Any]:
     return {
         "best_obj": _safe_float(best, "solution.total_score"),
         "best_sel": _safe_float(best, "solution.acquisitions"),
-        "best_time": _safe_float(best, "rko.solver_time"),
+        "best_time": _safe_float(best, "rko.time_to_best"),
+        "best_solver_time": _safe_float(best, "rko.solver_time"),
         "mean_obj": _safe_float(mean, "solution.total_score"),
         "mean_sel": _safe_float(mean, "solution.acquisitions"),
-        "mean_time": _safe_float(mean, "rko.solver_time"),
+        "mean_time": _safe_float(mean, "rko.time_to_best"),
+        "mean_solver_time": _safe_float(mean, "rko.solver_time"),
     }
 
 
